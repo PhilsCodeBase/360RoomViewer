@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>360° Panorama Viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #000; height: 100%; touch-action: none; font-family: 'Poppins', system-ui, sans-serif; }
+  #canvas-container { width: 100vw; height: 100vh; position: relative; cursor: grab; }
+  #canvas-container.dragging { cursor: grabbing; }
+
+  #hint {
+    position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.85); font: 500 13px 'Poppins', sans-serif;
+    background: rgba(0,0,0,0.35); padding: 8px 16px; border-radius: 20px;
+    pointer-events: none; transition: opacity 0.6s ease; letter-spacing: 0.2px;
+  }
+  #hint.hidden { opacity: 0; }
+
+  #scene-select {
+    position: absolute; top: 20px; left: 20px;
+    color: #fff; font: 600 15px 'Poppins', sans-serif;
+    background: rgba(0,0,0,0.45) url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>') no-repeat right 12px center;
+    background-size: 16px;
+    padding: 10px 38px 10px 16px; border-radius: 10px;
+    letter-spacing: 0.3px; border: 1px solid rgba(255,255,255,0.2);
+    appearance: none; -webkit-appearance: none; cursor: pointer;
+  }
+  #scene-select option {
+    background: #1a1a1a; color: #fff; font-family: 'Poppins', sans-serif;
+  }
+
+  #fade {
+    position: absolute; inset: 0; background: #000; opacity: 0;
+    pointer-events: none; transition: opacity 0.4s ease;
+  }
+  #fade.active { opacity: 1; }
+
+  #calibrate-toggle {
+    position: absolute; top: 20px; right: 20px;
+    color: #fff; font: 600 13px 'Poppins', sans-serif;
+    background: rgba(0,0,0,0.35); padding: 8px 14px; border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.25); cursor: pointer;
+  }
+  #calibrate-toggle.active { background: #e8b04b; color: #111; border-color: #e8b04b; }
+
+  #calibrate-readout {
+    position: absolute; top: 66px; right: 20px;
+    color: #fff; font: 500 13px/1.5 ui-monospace, monospace;
+    background: rgba(0,0,0,0.55); padding: 10px 14px; border-radius: 10px;
+    max-width: 240px; display: none; white-space: pre-wrap;
+  }
+  #calibrate-readout.visible { display: block; }
+</style>
+</head>
+<body>
+
+<div id="canvas-container">
+  <select id="scene-select"></select>
+  <div id="hint">Ziehen zum Umschauen · Punkt antippen zum Wechseln</div>
+  <div id="calibrate-toggle">📍 Position ermitteln</div>
+  <div id="calibrate-readout"></div>
+  <div id="fade"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function () {
+  // ---------------------------------------------------------------
+  // KONFIGURATION: hier trägst du deine eigenen 360°-Bilder ein.
+  // "image" muss eine equirektangulare Panorama-Datei sein (2:1
+  // Seitenverhältnis, z.B. 4000x2000px), typisches Format von 360°-Kameras.
+  // Hotspots: yaw = Winkel horizontal (0-360°), pitch = Winkel vertikal
+  // (-90 bis 90°). "target" verweist auf die id der Zielszene.
+  // ---------------------------------------------------------------
+  const scenes = {
+    room1: {
+      label: "Raum 1",
+      image: null, // null = Platzhalter-Textur wird generiert; sonst z.B. "meine-bilder/wohnzimmer.jpg"
+      placeholderSeed: 1,
+      hotspots: [
+        { yaw: 90, pitch: -5, target: "room2" },
+        { yaw: 200, pitch: -5, target: "room3" }
+      ]
+    },
+    room2: {
+      label: "Raum 2",
+      image: null,
+      placeholderSeed: 2,
+      hotspots: [
+        { yaw: 270, pitch: -5, target: "room1" },
+        { yaw: 40, pitch: -5, target: "room3" }
+      ]
+    },
+    room3: {
+      label: "Raum 3",
+      image: null,
+      placeholderSeed: 3,
+      hotspots: [
+        { yaw: 20, pitch: -5, target: "room1" },
+        { yaw: 220, pitch: -5, target: "room2" }
+      ]
+    }
+  };
+
+  // ---------------------------------------------------------------
+  // Platzhalter-Panorama generieren (nur für die Demo).
+  // Ersetze das durch new THREE.TextureLoader().load(url) mit deinem Bild.
+  // ---------------------------------------------------------------
+  function generatePlaceholderTexture(seed) {
+    const w = 2048, h = 1024;
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext("2d");
+
+    const palettes = [
+      { sky: ["#2b3a55", "#4d6a8a"], floor: ["#3a2f28", "#1c1712"], accent: "#e8b04b" },
+      { sky: ["#1f3d33", "#3f7362"], floor: ["#241d17", "#100d0a"], accent: "#e0623f" },
+      { sky: ["#3a2249", "#6a4a86"], floor: ["#1f1522", "#0c090e"], accent: "#4fc3d9" }
+    ];
+    const p = palettes[(seed - 1) % palettes.length];
+
+    const skyGrad = ctx.createLinearGradient(0, 0, 0, h / 2);
+    skyGrad.addColorStop(0, p.sky[0]);
+    skyGrad.addColorStop(1, p.sky[1]);
+    ctx.fillStyle = skyGrad;
+    ctx.fillRect(0, 0, w, h / 2);
+
+    const floorGrad = ctx.createLinearGradient(0, h / 2, 0, h);
+    floorGrad.addColorStop(0, p.floor[0]);
+    floorGrad.addColorStop(1, p.floor[1]);
+    ctx.fillStyle = floorGrad;
+    ctx.fillRect(0, h / 2, w, h / 2);
+
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.lineWidth = 2;
+    for (let i = 0; i < w; i += w / 16) {
+      ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, h); ctx.stroke();
+    }
+
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.font = "bold 42px 'Poppins', sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("Panorama " + seed + " (Platzhalter)", w / 2, h / 2 - 30);
+    ctx.font = "24px 'Poppins', sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.fillText("Ersetze dies durch dein eigenes 360°-Foto", w / 2, h / 2 + 15);
+
+    for (let i = 0; i < 6; i++) {
+      ctx.fillStyle = p.accent;
+      ctx.globalAlpha = 0.5;
+      ctx.beginPath();
+      ctx.arc((w / 6) * i + 100, h / 2 - 150 - (i % 2) * 80, 30, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.minFilter = THREE.LinearFilter;
+    return tex;
+  }
+
+  function loadTextureForScene(scene) {
+    if (scene.image) {
+      return new THREE.TextureLoader().load(scene.image);
+    }
+    return generatePlaceholderTexture(scene.placeholderSeed);
+  }
+
+  // ---------------------------------------------------------------
+  // Three.js Setup
+  // ---------------------------------------------------------------
+  const container = document.getElementById("canvas-container");
+  const sceneSelect = document.getElementById("scene-select");
+  const hint = document.getElementById("hint");
+  const fadeEl = document.getElementById("fade");
+
+  // Dropdown mit allen Räumen befüllen
+  Object.keys(scenes).forEach(key => {
+    const opt = document.createElement("option");
+    opt.value = key;
+    opt.textContent = scenes[key].label;
+    sceneSelect.appendChild(opt);
+  });
+  sceneSelect.addEventListener("change", () => {
+    if (sceneSelect.value !== currentSceneKey) goToScene(sceneSelect.value);
+  });
+
+  const scene3d = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(90, window.innerWidth / window.innerHeight, 1, 1100);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  container.appendChild(renderer.domElement);
+
+  // Kugel, von innen sichtbar (Normalen umgekehrt via negative Skalierung)
+  const sphereGeo = new THREE.SphereGeometry(500, 60, 40);
+  sphereGeo.scale(-1, 1, 1);
+  const sphereMat = new THREE.MeshBasicMaterial();
+  const sphereMesh = new THREE.Mesh(sphereGeo, sphereMat);
+  scene3d.add(sphereMesh);
+
+  // Kamera-Ausrichtung wird über yaw/pitch (Radiant) gesteuert
+  let yaw = 0, pitch = 0;
+  const PITCH_LIMIT = Math.PI / 2 - 0.05;
+
+  function updateCameraDirection() {
+    const target = new THREE.Vector3(
+      500 * Math.cos(pitch) * Math.sin(yaw),
+      500 * Math.sin(pitch),
+      -500 * Math.cos(pitch) * Math.cos(yaw)
+    );
+    camera.lookAt(target);
+  }
+
+  function yawPitchToPosition(yawDeg, pitchDeg, radius) {
+    const yawRad = THREE.MathUtils.degToRad(yawDeg);
+    const pitchRad = THREE.MathUtils.degToRad(pitchDeg);
+    return new THREE.Vector3(
+      radius * Math.cos(pitchRad) * Math.sin(yawRad),
+      radius * Math.sin(pitchRad),
+      -radius * Math.cos(pitchRad) * Math.cos(yawRad)
+    );
+  }
+
+  // ---------------------------------------------------------------
+  // Hotspots
+  // ---------------------------------------------------------------
+  function createLabeledHotspotSprite(labelText) {
+    const w = 320, h = 400;
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    const cx = w / 2, cy = 280; // Button-Mittelpunkt tiefer im Canvas, Platz für Text darüber
+
+    // Label-Text oberhalb des Buttons, mit dunkler Kontur für Lesbarkeit auf jedem Untergrund
+    ctx.font = "600 40px 'Poppins', sans-serif";
+    ctx.textAlign = "center";
+    ctx.lineWidth = 9;
+    ctx.strokeStyle = "rgba(0,0,0,0.85)";
+    ctx.strokeText(labelText, cx, 95);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(labelText, cx, 95);
+
+    // äußerer, weicher Glow-Ring
+    ctx.beginPath();
+    ctx.arc(cx, cy, 110, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.18)";
+    ctx.fill();
+
+    // Ring
+    ctx.beginPath();
+    ctx.arc(cx, cy, 82, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(20,20,20,0.5)";
+    ctx.fill();
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = "#ffffff";
+    ctx.stroke();
+
+    // gefüllter Kernpunkt
+    ctx.beginPath();
+    ctx.arc(cx, cy, 40, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+
+    const tex = new THREE.CanvasTexture(canvas);
+    const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+    const sprite = new THREE.Sprite(mat);
+    // Skalierung so, dass der Button selbst gleich groß bleibt wie zuvor (war 100x100 bei 256er Canvas)
+    sprite.scale.set(100 * (w / 256), 100 * (h / 256), 1);
+    // Anker auf den Button-Mittelpunkt legen, nicht auf die Canvas-Mitte -> Text schwebt darüber,
+    // die kalibrierte yaw/pitch-Position bleibt exakt beim Button selbst
+    sprite.center.set(0.5, (h - cy) / h);
+    return sprite;
+  }
+
+  function createHotspotSprite() {
+    const canvas = document.createElement("canvas");
+    const size = 256;
+    canvas.width = size; canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    const cx = size / 2, cy = size / 2;
+
+    // äußerer, weicher Glow-Ring
+    ctx.beginPath();
+    ctx.arc(cx, cy, 110, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.18)";
+    ctx.fill();
+
+    // Ring
+    ctx.beginPath();
+    ctx.arc(cx, cy, 82, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(20,20,20,0.5)";
+    ctx.fill();
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = "#ffffff";
+    ctx.stroke();
+
+    // gefüllter Kernpunkt
+    ctx.beginPath();
+    ctx.arc(cx, cy, 40, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+
+    const tex = new THREE.CanvasTexture(canvas);
+    const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+    const sprite = new THREE.Sprite(mat);
+    sprite.scale.set(100, 100, 1); // nochmal größer (vorher 65, ursprünglich 40)
+    return sprite;
+  }
+
+  let hotspotGroup = new THREE.Group();
+  scene3d.add(hotspotGroup);
+  const hotspotMeta = []; // { sprite, target }
+
+  function clearHotspots() {
+    hotspotGroup.children.forEach(c => {
+      c.material.map.dispose();
+      c.material.dispose();
+    });
+    hotspotGroup.clear();
+    hotspotMeta.length = 0;
+  }
+
+  function buildHotspots(sceneKey) {
+    clearHotspots();
+    calibrateMarker = null;
+    const def = scenes[sceneKey];
+    def.hotspots.forEach(h => {
+      const sprite = createLabeledHotspotSprite(scenes[h.target].label);
+      const pos = yawPitchToPosition(h.yaw, h.pitch, 480);
+      sprite.position.copy(pos);
+      hotspotGroup.add(sprite);
+      hotspotMeta.push({ sprite, target: h.target });
+    });
+  }
+
+  // ---------------------------------------------------------------
+  // Szenenwechsel
+  // ---------------------------------------------------------------
+  let currentSceneKey = "room1";
+
+  function goToScene(key) {
+    fadeEl.classList.add("active");
+    setTimeout(() => {
+      currentSceneKey = key;
+      const def = scenes[key];
+      sphereMat.map = loadTextureForScene(def);
+      sphereMat.needsUpdate = true;
+      sceneSelect.value = key;
+      buildHotspots(key);
+      fadeEl.classList.remove("active");
+    }, 380);
+  }
+
+  goToScene("room1");
+
+  // ---------------------------------------------------------------
+  // Touch- / Maus-Steuerung (Drag zum Umschauen)
+  // ---------------------------------------------------------------
+  let isDragging = false;
+  let lastX = 0, lastY = 0;
+  let dragDistance = 0;
+  const SENSITIVITY = 0.0045;
+
+  function pointerDown(x, y) {
+    isDragging = true;
+    dragDistance = 0;
+    lastX = x; lastY = y;
+    container.classList.add("dragging");
+  }
+  function pointerMove(x, y) {
+    if (!isDragging) return;
+    const dx = x - lastX;
+    const dy = y - lastY;
+    dragDistance += Math.abs(dx) + Math.abs(dy);
+    yaw -= dx * SENSITIVITY;
+    pitch = THREE.MathUtils.clamp(pitch + dy * SENSITIVITY, -PITCH_LIMIT, PITCH_LIMIT);
+    lastX = x; lastY = y;
+    updateCameraDirection();
+    hint.classList.add("hidden");
+  }
+  function pointerUp(x, y) {
+    isDragging = false;
+    container.classList.remove("dragging");
+    // Nur als "Tap" werten, wenn kaum bewegt wurde -> sonst zählt es als Drag
+    if (dragDistance < 6) {
+      handleTap(x, y);
+    }
+  }
+
+  container.addEventListener("mousedown", e => pointerDown(e.clientX, e.clientY));
+  window.addEventListener("mousemove", e => pointerMove(e.clientX, e.clientY));
+  window.addEventListener("mouseup", e => pointerUp(e.clientX, e.clientY));
+
+  container.addEventListener("touchstart", e => {
+    const t = e.touches[0];
+    pointerDown(t.clientX, t.clientY);
+  }, { passive: true });
+  container.addEventListener("touchmove", e => {
+    const t = e.touches[0];
+    pointerMove(t.clientX, t.clientY);
+  }, { passive: true });
+  container.addEventListener("touchend", e => {
+    const t = e.changedTouches[0];
+    pointerUp(t.clientX, t.clientY);
+  });
+
+  // ---------------------------------------------------------------
+  // Tap/Klick auf Hotspot erkennen (Raycasting)
+  // ---------------------------------------------------------------
+  const raycaster = new THREE.Raycaster();
+  const pointerNDC = new THREE.Vector2();
+
+  // Kalibrierungsmodus: Stelle im Panorama antippen -> exakte yaw/pitch anzeigen
+  let calibrateMode = false;
+  const calibrateToggle = document.getElementById("calibrate-toggle");
+  const calibrateReadout = document.getElementById("calibrate-readout");
+  let calibrateMarker = null;
+
+  calibrateToggle.addEventListener("click", () => {
+    calibrateMode = !calibrateMode;
+    calibrateToggle.classList.toggle("active", calibrateMode);
+    calibrateReadout.classList.toggle("visible", calibrateMode);
+    if (!calibrateMode) {
+      calibrateReadout.textContent = "";
+      if (calibrateMarker) { hotspotGroup.remove(calibrateMarker); calibrateMarker = null; }
+    } else {
+      calibrateReadout.textContent = "Tippe auf eine Stelle im Bild …";
+    }
+  });
+
+  function positionToYawPitch(point) {
+    const p = point.clone().normalize();
+    const pitchRad = Math.asin(p.y);
+    const yawRad = Math.atan2(p.x, -p.z);
+    let yawDeg = THREE.MathUtils.radToDeg(yawRad);
+    if (yawDeg < 0) yawDeg += 360;
+    const pitchDeg = THREE.MathUtils.radToDeg(pitchRad);
+    return { yaw: yawDeg, pitch: pitchDeg };
+  }
+
+  function handleTap(clientX, clientY) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    pointerNDC.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    pointerNDC.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+
+    raycaster.setFromCamera(pointerNDC, camera);
+
+    if (calibrateMode) {
+      const hit = raycaster.intersectObject(sphereMesh)[0];
+      if (!hit) return;
+      const { yaw, pitch } = positionToYawPitch(hit.point);
+
+      if (calibrateMarker) hotspotGroup.remove(calibrateMarker);
+      calibrateMarker = createHotspotSprite();
+      calibrateMarker.material.color.set(0xe8b04b);
+      calibrateMarker.position.copy(hit.point.clone().normalize().multiplyScalar(480));
+      hotspotGroup.add(calibrateMarker);
+
+      calibrateReadout.textContent =
+        `yaw: ${yaw.toFixed(1)}\npitch: ${pitch.toFixed(1)}\n\n` +
+        `{ yaw: ${yaw.toFixed(1)}, pitch: ${pitch.toFixed(1)}, target: "..." }`;
+      return;
+    }
+
+    const sprites = hotspotMeta.map(h => h.sprite);
+    const intersects = raycaster.intersectObjects(sprites);
+
+    if (intersects.length > 0) {
+      const hit = intersects[0].object;
+      const meta = hotspotMeta.find(h => h.sprite === hit);
+      if (meta) goToScene(meta.target);
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Resize & Render Loop
+  // ---------------------------------------------------------------
+  window.addEventListener("resize", () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  updateCameraDirection();
+
+  function animate() {
+    requestAnimationFrame(animate);
+    // Hotspots leicht zur Kamera ausrichten ist bei Sprites automatisch der Fall
+    renderer.render(scene3d, camera);
+  }
+  animate();
+})();
+</script>
+</body>
+</html>
